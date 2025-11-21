@@ -74,6 +74,8 @@
   - User management
   - Product inventory management
   - Sales reports generation
+  - sales transactions management
+  - product movement management
 
 ## 6. Content Management
 - **FR-013**: Dynamic Content
