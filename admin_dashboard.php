@@ -197,6 +197,119 @@ if (isset($_GET['fetch_product'])) {
     exit; // Ensure no further code executes
 }
 
+// ==================== ORDER DETAILS AJAX ENDPOINT ====================
+if (isset($_GET['get_order_details'])) {
+    $order_id = intval($_GET['get_order_details']);
+    header('Content-Type: application/json');
+    
+    if ($order_id <= 0) {
+        echo json_encode(['error' => 'Invalid order ID']);
+        exit;
+    }
+
+    try {
+        // Fetch order details
+        $stmt = $conn->prepare("
+            SELECT o.*, u.username, u.email, u.phone, u.address 
+            FROM orders o 
+            LEFT JOIN users u ON o.user_id = u.id 
+            WHERE o.id = ?
+        ");
+        if (!$stmt) {
+            throw new Exception('Database preparation failed: ' . $conn->error);
+        }
+        $stmt->bind_param("i", $order_id);
+        if (!$stmt->execute()) {
+            throw new Exception('Database execution failed: ' . $stmt->error);
+        }
+        $res = $stmt->get_result();
+        $order = $res->fetch_assoc();
+        $stmt->close();
+        
+        if (!$order) {
+            echo json_encode(['error' => 'Order not found']);
+            exit;
+        }
+        
+        // Fetch order items
+        $stmt = $conn->prepare("
+            SELECT oi.*, p.name as product_name, p.price as product_price, p.image_path 
+            FROM order_items oi 
+            LEFT JOIN products p ON oi.product_id = p.id 
+            WHERE oi.order_id = ?
+        ");
+        if (!$stmt) {
+            throw new Exception('Database preparation failed: ' . $conn->error);
+        }
+        $stmt->bind_param("i", $order_id);
+        if (!$stmt->execute()) {
+            throw new Exception('Database execution failed: ' . $stmt->error);
+        }
+        $res = $stmt->get_result();
+        $items = [];
+        while ($row = $res->fetch_assoc()) {
+            $items[] = $row;
+        }
+        $stmt->close();
+        
+        echo json_encode([
+            'success' => true,
+            'order' => $order,
+            'items' => $items
+        ]);
+        
+    } catch (Exception $e) {
+        $errorMsg = 'Error fetching order details: ' . $e->getMessage();
+        error_log($errorMsg . ' at ' . date('Y-m-d H:i:s'));
+        echo json_encode(['error' => $errorMsg]);
+    }
+    exit;
+}
+
+// ==================== RETURN DETAILS AJAX ENDPOINT ====================
+if (isset($_GET['get_return_details'])) {
+    $return_id = intval($_GET['get_return_details']);
+    header('Content-Type: application/json');
+    
+    if ($return_id <= 0) {
+        echo json_encode(['error' => 'Invalid return ID']);
+        exit;
+    }
+
+    try {
+        $stmt = $conn->prepare("
+            SELECT r.*, o.user_id, u.username, u.email, u.phone, p.name as product_name, p.price as product_price
+            FROM returns r 
+            LEFT JOIN orders o ON r.order_id = o.id 
+            LEFT JOIN users u ON o.user_id = u.id 
+            LEFT JOIN products p ON r.product_id = p.id 
+            WHERE r.id = ?
+        ");
+        if (!$stmt) {
+            throw new Exception('Database preparation failed: ' . $conn->error);
+        }
+        $stmt->bind_param("i", $return_id);
+        if (!$stmt->execute()) {
+            throw new Exception('Database execution failed: ' . $stmt->error);
+        }
+        $res = $stmt->get_result();
+        $return = $res->fetch_assoc();
+        $stmt->close();
+        
+        if ($return) {
+            echo json_encode(['success' => true, 'return' => $return]);
+        } else {
+            echo json_encode(['error' => 'Return request not found']);
+        }
+        
+    } catch (Exception $e) {
+        $errorMsg = 'Error fetching return details: ' . $e->getMessage();
+        error_log($errorMsg . ' at ' . date('Y-m-d H:i:s'));
+        echo json_encode(['error' => $errorMsg]);
+    }
+    exit;
+}
+
 // Global categories
 $valid_categories = ['Bags', 'Branded Jumpers', 'Bottles', 'Pens', 'Note Books', 'Wall Clocks', 'T-Shirts'];
 
@@ -211,6 +324,9 @@ $return_statuses = ['Pending', 'Approved', 'Rejected', 'Completed'];
 
 // User roles
 $user_roles = ['admin', 'manager', 'staff', 'customer'];
+
+// Payment methods
+$payment_methods = ['Cash', 'Mobile Money', 'Bank Transfer', 'Card', 'PayPal'];
 
 // Helper
 function post_val($k, $d='') { return isset($_POST[$k]) ? $_POST[$k] : $d; }
@@ -847,7 +963,7 @@ if (isset($_GET['process_return'])) {
             // If approved, process refund and restock
             if ($action === 'approve') {
                 // Get return details
-                $return_stmt = $conn->prepare("SELECT r.order_id, r.product_id, r.quantity, oi.price FROM returns r JOIN order_items oi ON r.order_id = oi.order_id AND r.product_id = oi.product_id WHERE r.id = ?");
+                $return_stmt = $conn->prepare("SELECT r.order_id, r.product_id, r.quantity, r.refund_amount FROM returns r WHERE r.id = ?");
                 $return_stmt->bind_param("i", $return_id);
                 $return_stmt->execute();
                 $return_result = $return_stmt->get_result();
@@ -862,21 +978,8 @@ if (isset($_GET['process_return'])) {
                     // Log the return in product movements
                     logProductMovement($return_row['product_id'], 'Return', $return_row['quantity'], $_SESSION['username'], 'System', 'Return from order #' . $return_row['order_id']);
                     
-                    // Update order status to refunded if all items are returned
-                    $check_order_stmt = $conn->prepare("
-                        SELECT COUNT(*) as total_items, 
-                               SUM(CASE WHEN r.status = 'Approved' THEN 1 ELSE 0 END) as returned_items 
-                        FROM order_items oi 
-                        LEFT JOIN returns r ON oi.order_id = r.order_id AND oi.product_id = r.product_id 
-                        WHERE oi.order_id = ?
-                    ");
-                    $check_order_stmt->bind_param("i", $return_row['order_id']);
-                    $check_order_stmt->execute();
-                    $check_result = $check_order_stmt->get_result();
-                    $check_data = $check_result->fetch_assoc();
-                    $check_order_stmt->close();
-                    
-                    if ($check_data['total_items'] == $check_data['returned_items']) {
+                    // Update order status to refunded if refund amount > 0
+                    if ($return_row['refund_amount'] > 0) {
                         $update_order_stmt = $conn->prepare("UPDATE orders SET status = 'Refunded' WHERE id = ?");
                         $update_order_stmt->bind_param("i", $return_row['order_id']);
                         $update_order_stmt->execute();
@@ -909,83 +1012,198 @@ if (isset($_GET['delete_return'])) {
     }
 }
 
-        // --------------------
-        // PRINT SALES REPORT
-        // --------------------
-        if (isset($_GET['print_report'])) {
-            $report_type = $_GET['print_report'];
-            $start_date = $_GET['start_date'] ?? date('Y-m-01');
-            $end_date = $_GET['end_date'] ?? date('Y-m-t');
-            
-            // Generate report data
-            $report_data = [];
-            $report_title = "";
-            
-            if ($report_type === 'sales_summary') {
-            $report_title = "Sales Summary Report";
-            
-            // In the sales summary report section, update the query:
-            $stmt = $conn->prepare("
-                SELECT 
-                    DATE(pd.created_at) as sale_date,
-                    COALESCE(pd.product_name, 'Various Products') as product_name,
-                    pd.product_id,
-                    pd.product_image,
-                    pd.quantity,
-                    COUNT(*) as order_count,
-                    COALESCE(SUM(pd.amount), 0) as total_amount,
-                    COALESCE(AVG(pd.amount), 0) as avg_order_value,
-                    pd.status
-                FROM pending_deliveries pd
-                WHERE DATE(pd.created_at) BETWEEN ? AND ?
-                GROUP BY DATE(pd.created_at), pd.product_id, pd.status
-                ORDER BY sale_date DESC, product_name
-            ");
-            $stmt->bind_param("ss", $start_date, $end_date);
-            $stmt->execute();
-            $result = $stmt->get_result();
-            while ($row = $result->fetch_assoc()) {
-                $report_data[] = $row;
-            }
-            $stmt->close();
-            
-            // If no data found, show empty message
-            if (empty($report_data)) {
-                $report_data[] = [
-                    'sale_date' => $start_date,
-                    'product_name' => 'No products',
-                    'order_count' => 0,
-                    'total_amount' => 0,
-                    'avg_order_value' => 0,
-                    'status' => 'No data found'
-                ];
-            }
-        } elseif ($report_type === 'category_sales') {
-        $report_title = "Category Sales Report";
+// ==================== REPORT GENERATION ====================
+if (isset($_GET['print_report'])) {
+    $report_type = $_GET['print_report'];
+    $start_date = $_GET['start_date'] ?? date('Y-m-01');
+    $end_date = $_GET['end_date'] ?? date('Y-m-t');
+    
+    // Generate report data
+    $report_data = [];
+    $report_title = "";
+    
+    if ($report_type === 'sales_summary') {
+        $report_title = "Sales Summary Report";
         
-        // Simplified category sales report
+        // Sales summary report with proper joins
         $stmt = $conn->prepare("
             SELECT 
+                DATE(o.created_at) as sale_date,
+                o.id as order_id,
+                u.username as customer_name,
+                COUNT(DISTINCT oi.product_id) as product_count,
+                SUM(oi.quantity) as total_quantity,
+                o.total_amount,
+                o.payment_method,
+                o.status
+            FROM orders o 
+            LEFT JOIN users u ON o.user_id = u.id 
+            LEFT JOIN order_items oi ON o.id = oi.order_id
+            WHERE DATE(o.created_at) BETWEEN ? AND ?
+            GROUP BY o.id
+            ORDER BY sale_date DESC
+        ");
+        $stmt->bind_param("ss", $start_date, $end_date);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        while ($row = $result->fetch_assoc()) {
+            $report_data[] = $row;
+        }
+        $stmt->close();
+        
+        // If no data found, show empty message
+        if (empty($report_data)) {
+            $report_data[] = [
+                'sale_date' => $start_date,
+                'product_count' => 0,
+                'total_quantity' => 0,
+                'total_amount' => 0,
+                'status' => 'No data found'
+            ];
+        }
+    } elseif ($report_type === 'category_sales') {
+        $report_title = "Category Sales Report";
+        
+        // Category sales report
+        $stmt = $conn->prepare("
+            SELECT 
+                p.category,
+                COUNT(DISTINCT p.id) as product_count,
+                SUM(oi.quantity) as total_sold,
+                SUM(oi.quantity * oi.price) as total_revenue,
+                AVG(p.price) as avg_price
+            FROM order_items oi
+            JOIN products p ON oi.product_id = p.id
+            JOIN orders o ON oi.order_id = o.id
+            WHERE o.status = 'Delivered' AND o.created_at BETWEEN ? AND ?
+            GROUP BY p.category
+            ORDER BY total_revenue DESC
+        ");
+        $stmt->bind_param("ss", $start_date, $end_date);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        while ($row = $result->fetch_assoc()) {
+            $report_data[] = $row;
+        }
+        $stmt->close();
+    } elseif ($report_type === 'stock_report') {
+        $report_title = "Stock Inventory Report";
+        
+        // Stock report
+        $stmt = $conn->prepare("
+            SELECT 
+                name,
                 category,
-                COUNT(*) as product_count,
-                COALESCE(SUM(price * stock), 0) as inventory_value,
-                COALESCE(AVG(price), 0) as avg_price
+                price,
+                stock,
+                (price * stock) as stock_value
             FROM products 
             WHERE name NOT LIKE 'CATEGORY_%'
-            GROUP BY category
-            ORDER BY inventory_value DESC
+            ORDER BY stock_value DESC
         ");
         $stmt->execute();
         $result = $stmt->get_result();
         while ($row = $result->fetch_assoc()) {
-            $report_data[] = [
-                'category' => $row['category'],
-                'product_count' => $row['product_count'],
-                'total_sales' => $row['inventory_value'],
-                'avg_price' => $row['avg_price']
-            ];
+            $report_data[] = $row;
         }
         $stmt->close();
+    } elseif ($report_type === 'movement_report') {
+        $report_title = "Product Movement Report";
+        
+        // Movement report
+        $stmt = $conn->prepare("
+            SELECT 
+                DATE(pm.created_at) as movement_date,
+                p.name as product_name,
+                pm.movement_type,
+                pm.quantity,
+                pm.issued_by,
+                pm.received_by,
+                pm.remarks
+            FROM product_movements pm
+            LEFT JOIN products p ON pm.product_id = p.id
+            WHERE DATE(pm.created_at) BETWEEN ? AND ?
+            ORDER BY pm.created_at DESC
+        ");
+        $stmt->bind_param("ss", $start_date, $end_date);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        while ($row = $result->fetch_assoc()) {
+            $report_data[] = $row;
+        }
+        $stmt->close();
+    } elseif ($report_type === 'customer_behavior') {
+        $report_title = "Customer Behavior Report";
+        
+        // Customer behavior report
+        $stmt = $conn->prepare("
+            SELECT 
+                u.username,
+                u.email,
+                COUNT(o.id) as total_orders,
+                SUM(o.total_amount) as total_spent,
+                AVG(o.total_amount) as avg_order_value,
+                MAX(o.created_at) as last_order_date
+            FROM users u
+            LEFT JOIN orders o ON u.id = o.user_id
+            WHERE o.created_at BETWEEN ? AND ?
+            GROUP BY u.id
+            HAVING total_orders > 0
+            ORDER BY total_spent DESC
+        ");
+        $stmt->bind_param("ss", $start_date, $end_date);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        while ($row = $result->fetch_assoc()) {
+            $report_data[] = $row;
+        }
+        $stmt->close();
+    } elseif ($report_type === 'financial') {
+        $report_title = "Financial Summary Report";
+        
+        // Financial report
+        $revenue_stmt = $conn->prepare("
+            SELECT SUM(total_amount) as total_revenue
+            FROM orders 
+            WHERE status = 'Delivered' AND created_at BETWEEN ? AND ?
+        ");
+        $revenue_stmt->bind_param("ss", $start_date, $end_date);
+        $revenue_stmt->execute();
+        $revenue_result = $revenue_stmt->get_result();
+        $revenue = $revenue_result->fetch_assoc();
+        $revenue_stmt->close();
+        
+        $refunds_stmt = $conn->prepare("
+            SELECT SUM(refund_amount) as total_refunds
+            FROM returns 
+            WHERE status IN ('Approved', 'Completed') AND created_at BETWEEN ? AND ?
+        ");
+        $refunds_stmt->bind_param("ss", $start_date, $end_date);
+        $refunds_stmt->execute();
+        $refunds_result = $refunds_stmt->get_result();
+        $refunds = $refunds_result->fetch_assoc();
+        $refunds_stmt->close();
+        
+        $orders_stmt = $conn->prepare("
+            SELECT COUNT(*) as total_orders, AVG(total_amount) as avg_order_value
+            FROM orders 
+            WHERE created_at BETWEEN ? AND ?
+        ");
+        $orders_stmt->bind_param("ss", $start_date, $end_date);
+        $orders_stmt->execute();
+        $orders_result = $orders_stmt->get_result();
+        $orders = $orders_result->fetch_assoc();
+        $orders_stmt->close();
+        
+        $report_data = [
+            'total_revenue' => $revenue['total_revenue'] ?? 0,
+            'total_refunds' => $refunds['total_refunds'] ?? 0,
+            'net_revenue' => ($revenue['total_revenue'] ?? 0) - ($refunds['total_refunds'] ?? 0),
+            'total_orders' => $orders['total_orders'] ?? 0,
+            'avg_order_value' => $orders['avg_order_value'] ?? 0,
+            'start_date' => $start_date,
+            'end_date' => $end_date
+        ];
     }
     
     // Store report data in session for printing
@@ -998,7 +1216,7 @@ if (isset($_GET['delete_return'])) {
         'generated_at' => date('Y-m-d H:i:s')
     ];
     
-    header("Location: admin_dashboard.php?show_print=true");
+    header("Location: admin_dashboard.php?show_print=true&section=reports");
     exit;
 }
 
@@ -1006,7 +1224,7 @@ if (isset($_GET['delete_return'])) {
 // FETCH DASHBOARD DATA
 // --------------------
 $totalSales = 0;
-if ($res = $conn->query("SELECT COALESCE(SUM(amount), 0) AS total_sales FROM pending_deliveries WHERE status = 'Completed'")) {
+if ($res = $conn->query("SELECT COALESCE(SUM(total_amount), 0) AS total_sales FROM orders WHERE status = 'Delivered'")) {
     $r = $res->fetch_assoc(); $totalSales = floatval($r['total_sales']);
 }
 
@@ -1083,9 +1301,9 @@ $movementData = [$totalSold, $totalGifts, $totalDamaged, $totalPromotions, $tota
 // Sales by month (last 12 months) - FIXED with COALESCE
 $salesLabels = []; $salesData = [];
 $months_sql = "
-    SELECT DATE_FORMAT(created_at, '%Y-%m') AS ym, COALESCE(SUM(amount), 0) AS total
-    FROM pending_deliveries
-    WHERE status = 'Completed' AND created_at >= DATE_SUB(CURDATE(), INTERVAL 11 MONTH)
+    SELECT DATE_FORMAT(created_at, '%Y-%m') AS ym, COALESCE(SUM(total_amount), 0) AS total
+    FROM orders
+    WHERE status = 'Delivered' AND created_at >= DATE_SUB(CURDATE(), INTERVAL 11 MONTH)
     GROUP BY ym
     ORDER BY ym ASC
 ";
@@ -1107,7 +1325,10 @@ if ($res = $conn->query("SELECT category, COUNT(*) AS cnt FROM products WHERE na
 
 // Recent orders (last 8)
 $recentOrders = [];
-if ($res = $conn->query("SELECT id, username, amount, payment_method, status, created_at FROM pending_deliveries ORDER BY created_at DESC LIMIT 8")) {
+if ($res = $conn->query("SELECT o.id, u.username, o.total_amount, o.payment_method, o.status, o.created_at 
+                         FROM orders o 
+                         LEFT JOIN users u ON o.user_id = u.id 
+                         ORDER BY o.created_at DESC LIMIT 8")) {
     while ($r = $res->fetch_assoc()) {
         $recentOrders[] = $r;
     }
@@ -1192,6 +1413,7 @@ if ($check_column->num_rows > 0) {
     $order_query = "
         SELECT o.*, u.username, u.email,
                GROUP_CONCAT(DISTINCT p.name SEPARATOR ', ') as product_names,
+               GROUP_CONCAT(DISTINCT oi.quantity SEPARATOR ', ') as quantities,
                COUNT(oi.id) as item_count
         FROM orders o 
         LEFT JOIN users u ON o.user_id = u.id 
@@ -1205,6 +1427,7 @@ if ($check_column->num_rows > 0) {
     $order_query = "
         SELECT o.*, u.username, u.email,
                GROUP_CONCAT(DISTINCT p.name SEPARATOR ', ') as product_names,
+               GROUP_CONCAT(DISTINCT oi.quantity SEPARATOR ', ') as quantities,
                COUNT(oi.id) as item_count
         FROM orders o 
         LEFT JOIN users u ON o.user_id = u.id 
@@ -1227,7 +1450,7 @@ function getOrderItems($order_id) {
     global $conn;
     $items = [];
     $stmt = $conn->prepare("
-        SELECT oi.*, p.name as product_name, p.image_path 
+        SELECT oi.*, p.name as product_name, p.image_path, p.category
         FROM order_items oi 
         LEFT JOIN products p ON oi.product_id = p.id 
         WHERE oi.order_id = ?
@@ -1242,6 +1465,24 @@ function getOrderItems($order_id) {
     return $items;
 }
 
+// Fetch order details with customer info
+function getOrderDetails($order_id) {
+    global $conn;
+    $stmt = $conn->prepare("
+        SELECT o.*, u.username, u.email, u.phone, u.address,
+               o.shipping_address, o.payment_method, o.total_amount, o.status, o.created_at
+        FROM orders o 
+        LEFT JOIN users u ON o.user_id = u.id 
+        WHERE o.id = ?
+    ");
+    $stmt->bind_param("i", $order_id);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $order = $result->fetch_assoc();
+    $stmt->close();
+    return $order;
+}
+
 // Fetch users for user management
 $users = [];
 if ($res = $conn->query("SELECT id, username, email, role, created_at FROM users ORDER BY created_at DESC LIMIT 200")) {
@@ -1253,7 +1494,7 @@ if ($res = $conn->query("SELECT id, username, email, role, created_at FROM users
 // Fetch returns for returns management
 $returns = [];
 if ($res = $conn->query("
-    SELECT r.*, o.id as order_id, u.username, p.name as product_name 
+    SELECT r.*, o.id as order_id, u.username, p.name as product_name, p.price as product_price
     FROM returns r 
     LEFT JOIN orders o ON r.order_id = o.id 
     LEFT JOIN users u ON o.user_id = u.id 
@@ -1494,6 +1735,13 @@ body.dark .modal {
 .return-rejected { background: #f8d7da; color: #721c24; }
 .return-completed { background: #e8f5e8; color: #388e3c; }
 
+/* Payment method badges */
+.payment-cash { background: #d1f7c4; color: #2e7d32; }
+.payment-mobile { background: #e6f3ff; color: #0b63ff; }
+.payment-bank { background: #f0f4c3; color: #9e9d24; }
+.payment-card { background: #f8bbd0; color: #ad1457; }
+.payment-paypal { background: #e3f2fd; color: #1565c0; }
+
 /* Print Styles */
 @media print {
     body * {
@@ -1572,6 +1820,48 @@ textarea { resize: vertical; min-height: 60px; }
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+/* Order details styles */
+.order-details-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 0;
+    border-bottom: 1px solid #e6eefc;
+}
+
+.order-details-label {
+    font-weight: 600;
+    color: var(--muted);
+}
+
+.order-details-value {
+    text-align: right;
+}
+
+.order-items-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 10px 0;
+}
+
+.order-items-table th {
+    background: #f1f5f9;
+    padding: 8px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--muted);
+}
+
+.order-items-table td {
+    padding: 8px;
+    border-bottom: 1px solid #e6eefc;
+}
+
+.order-total {
+    background: #f8fafc;
+    font-weight: 700;
+    font-size: 16px;
 }
 </style>
 </head>
@@ -1971,8 +2261,8 @@ textarea { resize: vertical; min-height: 60px; }
                                 <th>Items</th>
                                 <th>Products Ordered</th>
                                 <th>Amount</th>
+                                <th>Payment Method</th>
                                 <th>Status</th>
-                                <th>Payment</th>
                                 <th>Date</th>
                                 <th>Actions</th>
                             </tr>
@@ -1982,9 +2272,10 @@ textarea { resize: vertical; min-height: 60px; }
                                 <tr><td colspan="9" style="text-align:center; padding:20px;">No orders found.</td></tr>
                             <?php else: foreach ($orders as $order): 
                                 $status_class = 'status-' . strtolower(str_replace(' ', '-', $order['status']));
-                                $order_items = getOrderItems($order['id']);
-                                $item_count = count($order_items);
                                 $product_names = $order['product_names'] ?? 'No products';
+                                $payment_method = $order['payment_method'] ?? 'Cash';
+                                $payment_class = 'payment-' . strtolower(str_replace(' ', '-', $payment_method));
+                                $item_count = $order['item_count'] ?? 0;
                             ?>
                             <tr>
                                 <td><strong>#<?php echo htmlspecialchars($order['id']); ?></strong></td>
@@ -2000,12 +2291,16 @@ textarea { resize: vertical; min-height: 60px; }
                                 </td>
                                 <td><strong>UGX <?php echo number_format($order['total_amount']); ?></strong></td>
                                 <td>
+                                    <span class="status-badge <?php echo $payment_class; ?>" style="padding:4px 8px; border-radius:12px; font-size:11px; font-weight:600; text-transform:uppercase;">
+                                        <?php echo htmlspecialchars($payment_method); ?>
+                                    </span>
+                                </td>
+                                <td>
                                     <span class="status-badge <?php echo $status_class; ?>" style="padding:4px 8px; border-radius:12px; font-size:11px; font-weight:600; text-transform:uppercase;">
                                         <?php echo htmlspecialchars($order['status']); ?>
                                     </span>
                                 </td>
-                                <td><?php echo htmlspecialchars($order['payment_method'] ?? 'Cash'); ?></td>
-                                <td style="font-size:12px;"><?php echo htmlspecialchars(date('M j, Y', strtotime($order['created_at']))); ?></td>
+                                <td style="font-size:12px;"><?php echo htmlspecialchars(date('M j, Y', strtotime($order['created_at'] ?? $order['id']))); ?></td>
                                 <td>
                                     <button class="small btn secondary" onclick="viewOrderDetails(<?php echo $order['id']; ?>)">View</button>
                                     <div class="dropdown" style="display:inline-block;">
@@ -2354,6 +2649,7 @@ textarea { resize: vertical; min-height: 60px; }
                                 <th>Product</th>
                                 <th>Quantity</th>
                                 <th>Reason</th>
+                                <th>Refund Amount</th>
                                 <th>Status</th>
                                 <th>Date</th>
                                 <th>Actions</th>
@@ -2361,9 +2657,10 @@ textarea { resize: vertical; min-height: 60px; }
                         </thead>
                         <tbody>
                             <?php if (count($returns) === 0): ?>
-                                <tr><td colspan="9" style="text-align:center; padding:20px;">No return requests found.</td></tr>
+                                <tr><td colspan="10" style="text-align:center; padding:20px;">No return requests found.</td></tr>
                             <?php else: foreach ($returns as $return): 
                                 $status_class = 'return-' . strtolower($return['status']);
+                                $refund_amount = $return['refund_amount'] ?? ($return['product_price'] ?? 0) * ($return['quantity'] ?? 1);
                             ?>
                             <tr>
                                 <td><strong>#<?php echo htmlspecialchars($return['id']); ?></strong></td>
@@ -2374,6 +2671,7 @@ textarea { resize: vertical; min-height: 60px; }
                                 <td title="<?php echo htmlspecialchars($return['reason']); ?>">
                                     <?php echo strlen($return['reason']) > 50 ? substr($return['reason'], 0, 50) . '...' : $return['reason']; ?>
                                 </td>
+                                <td>UGX <?php echo number_format($refund_amount); ?></td>
                                 <td>
                                     <span class="status-badge <?php echo $status_class; ?>" style="padding:4px 8px; border-radius:12px; font-size:11px; font-weight:600; text-transform:uppercase;">
                                         <?php echo htmlspecialchars($return['status']); ?>
@@ -2382,7 +2680,7 @@ textarea { resize: vertical; min-height: 60px; }
                                 <td style="font-size:12px;"><?php echo htmlspecialchars(date('M j, Y', strtotime($return['created_at']))); ?></td>
                                 <td>
                                     <?php if ($return['status'] === 'Pending'): ?>
-                                        <a class="small btn secondary" href="?process_return=1&return_id=<?php echo $return['id']; ?>&action=approve" onclick="return confirm('Approve this return request? This will restock the product.')">Approve</a>
+                                        <a class="small btn secondary" href="?process_return=1&return_id=<?php echo $return['id']; ?>&action=approve" onclick="return confirm('Approve this return request? This will restock the product and process refund.')">Approve</a>
                                         <a class="small btn warning" href="?process_return=1&return_id=<?php echo $return['id']; ?>&action=reject" onclick="return confirm('Reject this return request?')">Reject</a>
                                     <?php elseif ($return['status'] === 'Approved'): ?>
                                         <a class="small btn" href="?process_return=1&return_id=<?php echo $return['id']; ?>&action=complete" onclick="return confirm('Mark this return as completed?')">Complete</a>
@@ -2413,6 +2711,7 @@ textarea { resize: vertical; min-height: 60px; }
             <div class="panel" style="margin-bottom:16px;">
                 <h4 style="margin:0 0 12px 0;">Generate Printable Report</h4>
                 <form method="GET" action="admin_dashboard.php" id="reportForm">
+                    <input type="hidden" name="section" value="reports">
                     <div style="display:grid; grid-template-columns: 1fr 1fr auto auto; gap:10px; align-items:end;">
                         <div>
                             <label style="display:block; margin-bottom:5px; font-size:14px;">Report Type</label>
@@ -2462,44 +2761,43 @@ textarea { resize: vertical; min-height: 60px; }
                     <thead>
                         <tr style="background:linear-gradient(90deg,var(--primary),var(--primary-2)); color:#fff;">
                             <th style="padding:12px; text-align:left;">Date</th>
-                            <th style="padding:12px; text-align:left;">Product</th>
+                            <th style="padding:12px; text-align:left;">Order ID</th>
+                            <th style="padding:12px; text-align:left;">Customer</th>
+                            <th style="padding:12px; text-align:right;">Items</th>
+                            <th style="padding:12px; text-align:right;">Total Quantity</th>
+                            <th style="padding:12px; text-align:right;">Amount</th>
+                            <th style="padding:12px; text-align:left;">Payment</th>
                             <th style="padding:12px; text-align:left;">Status</th>
-                            <th style="padding:12px; text-align:right;">Orders</th>
-                            <th style="padding:12px; text-align:right;">Total Amount</th>
-                            <th style="padding:12px; text-align:right;">Avg. Order Value</th>
                         </tr>
                     </thead>
                     <tbody>
                         <?php 
                         $grand_total = 0;
                         $total_orders = 0;
+                        $total_items = 0;
+                        $total_quantity = 0;
                         foreach ($report['data'] as $row): 
                             // Ensure we have numeric values
-                            $order_count = intval($row['order_count'] ?? 0);
+                            $product_count = intval($row['product_count'] ?? 0);
                             $total_amount = floatval($row['total_amount'] ?? 0);
-                            $avg_value = floatval($row['avg_order_value'] ?? 0);
+                            $total_quantity_row = intval($row['total_quantity'] ?? 0);
                             
                             $grand_total += $total_amount;
-                            $total_orders += $order_count;
+                            $total_orders++;
+                            $total_items += $product_count;
+                            $total_quantity += $total_quantity_row;
                         ?>
                         <tr style="border-bottom:1px solid #f1f5f9;">
                             <td style="padding:10px;"><?php echo htmlspecialchars($row['sale_date'] ?? 'N/A'); ?></td>
-                            <td style="padding:10px;">
-                                <div style="display:flex; align-items:center; gap:8px;">
-                                    <?php if(!empty($row['product_image'])): ?>
-                                        <img src="<?php echo htmlspecialchars($row['product_image']); ?>" alt="Product" style="width:30px; height:30px; object-fit:cover; border-radius:4px;">
-                                    <?php endif; ?>
-                                    <div>
-                                        <div style="font-weight:600;"><?php echo htmlspecialchars($row['product_name'] ?? 'Various Products'); ?></div>
-                                        <?php if(!empty($row['product_id'])): ?>
-                                            <div style="font-size:11px; color:var(--muted);">ID: <?php echo htmlspecialchars($row['product_id']); ?></div>
-                                        <?php endif; ?>
-                                    </div>
-                                </div>
-                            </td>
+                            <td style="padding:10px;">#<?php echo htmlspecialchars($row['order_id'] ?? 'N/A'); ?></td>
+                            <td style="padding:10px;"><?php echo htmlspecialchars($row['customer_name'] ?? 'N/A'); ?></td>
+                            <td style="padding:10px; text-align:right;"><?php echo number_format($product_count); ?></td>
+                            <td style="padding:10px; text-align:right;"><?php echo number_format($total_quantity_row); ?></td>
+                            <td style="padding:10px; text-align:right;">UGX <?php echo number_format($total_amount, 2); ?></td>
+                            <td style="padding:10px;"><?php echo htmlspecialchars($row['payment_method'] ?? 'Cash'); ?></td>
                             <td style="padding:10px;">
                                 <span style="padding:3px 6px; border-radius:8px; font-size:10px; font-weight:600; text-transform:uppercase;
-                                    <?php if(($row['status'] ?? '') === 'Completed'): ?>
+                                    <?php if(($row['status'] ?? '') === 'Delivered'): ?>
                                         background:#e8f5e8; color:#388e3c;
                                     <?php elseif(($row['status'] ?? '') === 'Pending'): ?>
                                         background:#fff3cd; color:#856404;
@@ -2510,16 +2808,14 @@ textarea { resize: vertical; min-height: 60px; }
                                     <?php echo htmlspecialchars($row['status'] ?? 'Unknown'); ?>
                                 </span>
                             </td>
-                            <td style="padding:10px; text-align:right;"><?php echo number_format($order_count); ?></td>
-                            <td style="padding:10px; text-align:right;">UGX <?php echo number_format($total_amount, 2); ?></td>
-                            <td style="padding:10px; text-align:right;">UGX <?php echo number_format($avg_value, 2); ?></td>
                         </tr>
                         <?php endforeach; ?>
                         <tr style="background:#f8fafc; font-weight:bold;">
                             <td style="padding:12px;" colspan="3">TOTAL</td>
-                            <td style="padding:12px; text-align:right;"><?php echo number_format($total_orders); ?></td>
+                            <td style="padding:12px; text-align:right;"><?php echo number_format($total_items); ?></td>
+                            <td style="padding:12px; text-align:right;"><?php echo number_format($total_quantity); ?></td>
                             <td style="padding:12px; text-align:right;">UGX <?php echo number_format($grand_total, 2); ?></td>
-                            <td style="padding:12px; text-align:right;">UGX <?php echo number_format($total_orders > 0 ? $grand_total / $total_orders : 0, 2); ?></td>
+                            <td style="padding:12px;" colspan="2"><?php echo number_format($total_orders); ?> orders</td>
                         </tr>
                     </tbody>
                 </table>
@@ -2529,7 +2825,8 @@ textarea { resize: vertical; min-height: 60px; }
                         <tr style="background:linear-gradient(90deg,var(--primary),var(--primary-2)); color:#fff;">
                             <th style="padding:12px; text-align:left;">Category</th>
                             <th style="padding:12px; text-align:right;">Products</th>
-                            <th style="padding:12px; text-align:right;">Inventory Value</th>
+                            <th style="padding:12px; text-align:right;">Total Sold</th>
+                            <th style="padding:12px; text-align:right;">Total Revenue</th>
                             <th style="padding:12px; text-align:right;">Avg. Price</th>
                             <th style="padding:12px; text-align:right;">Percentage</th>
                         </tr>
@@ -2537,26 +2834,33 @@ textarea { resize: vertical; min-height: 60px; }
                     <tbody>
                         <?php 
                         $grand_total = 0;
+                        $total_products = 0;
+                        $total_sold = 0;
                         foreach ($report['data'] as $row) {
-                            $grand_total += floatval($row['total_sales'] ?? 0);
+                            $grand_total += floatval($row['total_revenue'] ?? 0);
+                            $total_products += intval($row['product_count'] ?? 0);
+                            $total_sold += intval($row['total_sold'] ?? 0);
                         }
                         foreach ($report['data'] as $row): 
                             $product_count = intval($row['product_count'] ?? 0);
-                            $inventory_value = floatval($row['total_sales'] ?? 0);
+                            $total_sold_row = intval($row['total_sold'] ?? 0);
+                            $total_revenue = floatval($row['total_revenue'] ?? 0);
                             $avg_price = floatval($row['avg_price'] ?? 0);
-                            $percentage = $grand_total > 0 ? ($inventory_value / $grand_total) * 100 : 0;
+                            $percentage = $grand_total > 0 ? ($total_revenue / $grand_total) * 100 : 0;
                         ?>
                         <tr style="border-bottom:1px solid #f1f5f9;">
                             <td style="padding:10px;"><?php echo htmlspecialchars($row['category'] ?? 'N/A'); ?></td>
                             <td style="padding:10px; text-align:right;"><?php echo number_format($product_count); ?></td>
-                            <td style="padding:10px; text-align:right;">UGX <?php echo number_format($inventory_value, 2); ?></td>
+                            <td style="padding:10px; text-align:right;"><?php echo number_format($total_sold_row); ?></td>
+                            <td style="padding:10px; text-align:right;">UGX <?php echo number_format($total_revenue, 2); ?></td>
                             <td style="padding:10px; text-align:right;">UGX <?php echo number_format($avg_price, 2); ?></td>
                             <td style="padding:10px; text-align:right;"><?php echo number_format($percentage, 1); ?>%</td>
                         </tr>
                         <?php endforeach; ?>
                         <tr style="background:#f8fafc; font-weight:bold;">
                             <td style="padding:12px;">TOTAL</td>
-                            <td style="padding:12px; text-align:right;"><?php echo number_format(array_sum(array_column($report['data'], 'product_count'))); ?></td>
+                            <td style="padding:12px; text-align:right;"><?php echo number_format($total_products); ?></td>
+                            <td style="padding:12px; text-align:right;"><?php echo number_format($total_sold); ?></td>
                             <td style="padding:12px; text-align:right;">UGX <?php echo number_format($grand_total, 2); ?></td>
                             <td style="padding:12px; text-align:right;">—</td>
                             <td style="padding:12px; text-align:right;">100%</td>
@@ -2608,6 +2912,146 @@ textarea { resize: vertical; min-height: 60px; }
                             <td style="padding:12px; text-align:right;"><?php echo number_format($total_items); ?></td>
                             <td style="padding:12px; text-align:right;">UGX <?php echo number_format($total_stock_value, 2); ?></td>
                             <td style="padding:12px; text-align:center;">—</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <?php elseif ($report['type'] === 'movement_report'): ?>
+                <table style="width:100%; border-collapse:collapse; margin-top:15px;">
+                    <thead>
+                        <tr style="background:linear-gradient(90deg,var(--primary),var(--primary-2)); color:#fff;">
+                            <th style="padding:12px; text-align:left;">Date</th>
+                            <th style="padding:12px; text-align:left;">Product</th>
+                            <th style="padding:12px; text-align:left;">Type</th>
+                            <th style="padding:12px; text-align:right;">Quantity</th>
+                            <th style="padding:12px; text-align:left;">Issued By</th>
+                            <th style="padding:12px; text-align:left;">Received By</th>
+                            <th style="padding:12px; text-align:left;">Remarks</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php 
+                        $total_quantity = 0;
+                        foreach ($report['data'] as $row): 
+                            $quantity = intval($row['quantity'] ?? 0);
+                            $total_quantity += $quantity;
+                        ?>
+                        <tr style="border-bottom:1px solid #f1f5f9;">
+                            <td style="padding:10px;"><?php echo htmlspecialchars($row['movement_date'] ?? 'N/A'); ?></td>
+                            <td style="padding:10px;"><?php echo htmlspecialchars($row['product_name'] ?? 'N/A'); ?></td>
+                            <td style="padding:10px;">
+                                <span style="padding:3px 6px; border-radius:8px; font-size:10px; font-weight:600; text-transform:uppercase;
+                                    <?php if(($row['movement_type'] ?? '') === 'Sale'): ?>
+                                        background:#e8f5e8; color:#388e3c;
+                                    <?php elseif(($row['movement_type'] ?? '') === 'Return'): ?>
+                                        background:#d1ecf1; color:#0c5460;
+                                    <?php elseif(($row['movement_type'] ?? '') === 'Gift'): ?>
+                                        background:#fff3cd; color:#856404;
+                                    <?php else: ?>
+                                        background:#f8d7da; color:#721c24;
+                                    <?php endif; ?>
+                                ">
+                                    <?php echo htmlspecialchars($row['movement_type'] ?? 'Unknown'); ?>
+                                </span>
+                            </td>
+                            <td style="padding:10px; text-align:right;"><?php echo number_format($quantity); ?></td>
+                            <td style="padding:10px;"><?php echo htmlspecialchars($row['issued_by'] ?? 'N/A'); ?></td>
+                            <td style="padding:10px;"><?php echo htmlspecialchars($row['received_by'] ?? 'N/A'); ?></td>
+                            <td style="padding:10px;"><?php echo htmlspecialchars($row['remarks'] ?? 'N/A'); ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                        <tr style="background:#f8fafc; font-weight:bold;">
+                            <td style="padding:12px;" colspan="3">TOTAL MOVEMENTS</td>
+                            <td style="padding:12px; text-align:right;"><?php echo number_format($total_quantity); ?></td>
+                            <td style="padding:12px;" colspan="3"><?php echo count($report['data']); ?> records</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <?php elseif ($report['type'] === 'customer_behavior'): ?>
+                <table style="width:100%; border-collapse:collapse; margin-top:15px;">
+                    <thead>
+                        <tr style="background:linear-gradient(90deg,var(--primary),var(--primary-2)); color:#fff;">
+                            <th style="padding:12px; text-align:left;">Customer</th>
+                            <th style="padding:12px; text-align:left;">Email</th>
+                            <th style="padding:12px; text-align:right;">Total Orders</th>
+                            <th style="padding:12px; text-align:right;">Total Spent</th>
+                            <th style="padding:12px; text-align:right;">Avg. Order Value</th>
+                            <th style="padding:12px; text-align:left;">Last Order</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php 
+                        $total_customers = 0;
+                        $total_all_orders = 0;
+                        $total_all_spent = 0;
+                        foreach ($report['data'] as $row): 
+                            $total_orders = intval($row['total_orders'] ?? 0);
+                            $total_spent = floatval($row['total_spent'] ?? 0);
+                            $avg_order_value = floatval($row['avg_order_value'] ?? 0);
+                            $total_customers++;
+                            $total_all_orders += $total_orders;
+                            $total_all_spent += $total_spent;
+                        ?>
+                        <tr style="border-bottom:1px solid #f1f5f9;">
+                            <td style="padding:10px;"><?php echo htmlspecialchars($row['username'] ?? 'N/A'); ?></td>
+                            <td style="padding:10px;"><?php echo htmlspecialchars($row['email'] ?? 'N/A'); ?></td>
+                            <td style="padding:10px; text-align:right;"><?php echo number_format($total_orders); ?></td>
+                            <td style="padding:10px; text-align:right;">UGX <?php echo number_format($total_spent, 2); ?></td>
+                            <td style="padding:10px; text-align:right;">UGX <?php echo number_format($avg_order_value, 2); ?></td>
+                            <td style="padding:10px;"><?php echo htmlspecialchars($row['last_order_date'] ? date('M j, Y', strtotime($row['last_order_date'])) : 'N/A'); ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                        <tr style="background:#f8fafc; font-weight:bold;">
+                            <td style="padding:12px;">TOTAL CUSTOMERS</td>
+                            <td style="padding:12px;"><?php echo number_format($total_customers); ?></td>
+                            <td style="padding:12px; text-align:right;"><?php echo number_format($total_all_orders); ?></td>
+                            <td style="padding:12px; text-align:right;">UGX <?php echo number_format($total_all_spent, 2); ?></td>
+                            <td style="padding:12px; text-align:right;">UGX <?php echo number_format($total_all_orders > 0 ? $total_all_spent / $total_all_orders : 0, 2); ?></td>
+                            <td style="padding:12px;">—</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <?php elseif ($report['type'] === 'financial'): ?>
+                <table style="width:100%; border-collapse:collapse; margin-top:15px;">
+                    <thead>
+                        <tr style="background:linear-gradient(90deg,var(--primary),var(--primary-2)); color:#fff;">
+                            <th style="padding:12px; text-align:left;">Metric</th>
+                            <th style="padding:12px; text-align:right;">Amount (UGX)</th>
+                            <th style="padding:12px; text-align:left;">Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr style="border-bottom:1px solid #f1f5f9;">
+                            <td style="padding:10px; font-weight:600;">Total Revenue</td>
+                            <td style="padding:10px; text-align:right;">UGX <?php echo number_format($report['data']['total_revenue'] ?? 0, 2); ?></td>
+                            <td style="padding:10px;">Revenue from completed orders</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid #f1f5f9;">
+                            <td style="padding:10px; font-weight:600;">Total Refunds</td>
+                            <td style="padding:10px; text-align:right;">UGX <?php echo number_format($report['data']['total_refunds'] ?? 0, 2); ?></td>
+                            <td style="padding:10px;">Amount refunded to customers</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid #f1f5f9;">
+                            <td style="padding:10px; font-weight:600;">Net Revenue</td>
+                            <td style="padding:10px; text-align:right;">UGX <?php echo number_format($report['data']['net_revenue'] ?? 0, 2); ?></td>
+                            <td style="padding:10px;">Revenue after refunds</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid #f1f5f9;">
+                            <td style="padding:10px; font-weight:600;">Total Orders</td>
+                            <td style="padding:10px; text-align:right;"><?php echo number_format($report['data']['total_orders'] ?? 0); ?></td>
+                            <td style="padding:10px;">Number of orders placed</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid #f1f5f9;">
+                            <td style="padding:10px; font-weight:600;">Average Order Value</td>
+                            <td style="padding:10px; text-align:right;">UGX <?php echo number_format($report['data']['avg_order_value'] ?? 0, 2); ?></td>
+                            <td style="padding:10px;">Average amount per order</td>
+                        </tr>
+                        <tr style="background:#f8fafc; font-weight:bold;">
+                            <td style="padding:12px;">REPORT PERIOD</td>
+                            <td style="padding:12px; text-align:right;" colspan="2">
+                                <?php echo htmlspecialchars($report['data']['start_date'] ?? $report['start_date']); ?> 
+                                to 
+                                <?php echo htmlspecialchars($report['data']['end_date'] ?? $report['end_date']); ?>
+                            </td>
                         </tr>
                     </tbody>
                 </table>
@@ -2855,61 +3299,55 @@ textarea { resize: vertical; min-height: 60px; }
         </div>
 
         <!-- Order Details Modal -->
-        <div id="orderDetailsModal" style="display:none;">
-            <div class="modal-overlay" id="orderOverlay">
-                <div class="modal" role="dialog" aria-modal="true" aria-label="Order details" style="max-width: 700px;">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
-                        <h3>Order Details</h3>
-                        <button class="btn secondary" id="closeOrderModal">Close</button>
-                    </div>
-                    <div id="orderDetailsContent">
-                        <!-- Order details will be loaded here -->
-                    </div>
+        <div id="orderDetailsModal" class="modal-overlay" style="display:none;">
+            <div class="modal" role="dialog" aria-modal="true" aria-label="Order details" style="max-width: 700px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
+                    <h3>Order Details</h3>
+                    <button class="btn secondary" onclick="document.getElementById('orderDetailsModal').style.display='none'">Close</button>
+                </div>
+                <div id="orderDetailsContent" style="max-height: 70vh; overflow-y: auto;">
+                    <!-- Order details will be loaded here via AJAX -->
                 </div>
             </div>
         </div>
 
         <!-- Edit User Role Modal -->
-        <div id="editUserRoleModal" style="display:none;">
-            <div class="modal-overlay" id="userOverlay">
-                <div class="modal" role="dialog" aria-modal="true" aria-label="Edit user role">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
-                        <h3>Edit User Role</h3>
-                        <button class="btn secondary" id="closeUserModal">Close</button>
-                    </div>
-                    <form id="editUserRoleForm" method="POST" action="admin_dashboard.php">
-                        <input type="hidden" name="update_user_role" value="1">
-                        <input type="hidden" id="user_id" name="user_id">
-                        
-                        <div style="margin-bottom:15px;">
-                            <label for="user_role">Select Role:</label>
-                            <select id="user_role" name="role" required style="width:100%; padding:10px; border-radius:8px; border:1px solid #e6eefc; margin-top:8px;">
-                                <?php foreach ($user_roles as $role): ?>
-                                    <option value="<?php echo $role; ?>"><?php echo ucfirst($role); ?></option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-                        
-                        <div style="text-align:right; margin-top:15px;">
-                            <button type="submit" class="btn">Update Role</button>
-                            <button type="button" class="btn secondary" id="cancelUserEdit">Cancel</button>
-                        </div>
-                    </form>
+        <div id="editUserRoleModal" class="modal-overlay" style="display:none;">
+            <div class="modal" role="dialog" aria-modal="true" aria-label="Edit user role">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
+                    <h3>Edit User Role</h3>
+                    <button class="btn secondary" onclick="document.getElementById('editUserRoleModal').style.display='none'">Close</button>
                 </div>
+                <form id="editUserRoleForm" method="POST" action="admin_dashboard.php">
+                    <input type="hidden" name="update_user_role" value="1">
+                    <input type="hidden" id="user_id" name="user_id">
+                    
+                    <div style="margin-bottom:15px;">
+                        <label for="user_role">Select Role:</label>
+                        <select id="user_role" name="role" required style="width:100%; padding:10px; border-radius:8px; border:1px solid #e6eefc; margin-top:8px;">
+                            <?php foreach ($user_roles as $role): ?>
+                                <option value="<?php echo $role; ?>"><?php echo ucfirst($role); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    
+                    <div style="text-align:right; margin-top:15px;">
+                        <button type="submit" class="btn">Update Role</button>
+                        <button type="button" class="btn secondary" onclick="document.getElementById('editUserRoleModal').style.display='none'">Cancel</button>
+                    </div>
+                </form>
             </div>
         </div>
 
         <!-- Return Details Modal -->
-        <div id="returnDetailsModal" style="display:none;">
-            <div class="modal-overlay" id="returnOverlay">
-                <div class="modal" role="dialog" aria-modal="true" aria-label="Return details" style="max-width: 600px;">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
-                        <h3>Return Request Details</h3>
-                        <button class="btn secondary" id="closeReturnModal">Close</button>
-                    </div>
-                    <div id="returnDetailsContent">
-                        <!-- Return details will be loaded here -->
-                    </div>
+        <div id="returnDetailsModal" class="modal-overlay" style="display:none;">
+            <div class="modal" role="dialog" aria-modal="true" aria-label="Return details" style="max-width: 600px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
+                    <h3>Return Request Details</h3>
+                    <button class="btn secondary" onclick="document.getElementById('returnDetailsModal').style.display='none'">Close</button>
+                </div>
+                <div id="returnDetailsContent" style="max-height: 70vh; overflow-y: auto;">
+                    <!-- Return details will be loaded here via AJAX -->
                 </div>
             </div>
         </div>
@@ -2943,6 +3381,13 @@ textarea { resize: vertical; min-height: 60px; }
         if (sections[name]) sections[name].style.display = '';
         menuLinks.forEach(a => { if (a.dataset.section === name) a.classList.add('active'); });
         document.getElementById('mainWrap').scrollTop = 0;
+        
+        // If showing reports section and there's a print report to show
+        if (name === 'reports' && window.location.search.includes('show_print=true')) {
+            setTimeout(() => {
+                document.getElementById('printableReport')?.scrollIntoView({behavior: 'smooth'});
+            }, 100);
+        }
     }
 
     menuLinks.forEach(a => {
@@ -2950,10 +3395,19 @@ textarea { resize: vertical; min-height: 60px; }
             e.preventDefault();
             const name = a.dataset.section;
             showSection(name);
+            // Update URL without reloading
+            history.pushState(null, '', `?section=${name}`);
         });
     });
 
-    showSection('overview');
+    // Check URL for section parameter
+    const urlParams = new URLSearchParams(window.location.search);
+    const sectionParam = urlParams.get('section');
+    if (sectionParam && sections[sectionParam]) {
+        showSection(sectionParam);
+    } else {
+        showSection('overview');
+    }
 
     // Search functionality
     document.getElementById('searchInput').addEventListener('input', function(e) {
@@ -3298,7 +3752,8 @@ textarea { resize: vertical; min-height: 60px; }
             
             // Add active class to clicked tab and corresponding content
             tab.classList.add('active');
-            document.getElementById(`tab-${tabName}`).classList.add('active');
+            const tabContent = document.getElementById(`tab-${tabName}`);
+            if (tabContent) tabContent.classList.add('active');
             
             // Filter orders based on tab
             filterOrdersByStatus(tabName);
@@ -3313,7 +3768,7 @@ textarea { resize: vertical; min-height: 60px; }
             } else {
                 const statusCell = row.querySelector('.status-badge');
                 if (statusCell) {
-                    const rowStatus = statusCell.textContent.toLowerCase();
+                    const rowStatus = statusCell.textContent.toLowerCase().replace(/-/g, ' ');
                     row.style.display = rowStatus === status ? '' : 'none';
                 }
             }
@@ -3334,7 +3789,8 @@ textarea { resize: vertical; min-height: 60px; }
             
             // Add active class to clicked tab and corresponding content
             tab.classList.add('active');
-            document.getElementById(`tab-${tabName}`).classList.add('active');
+            const tabContent = document.getElementById(`tab-${tabName}`);
+            if (tabContent) tabContent.classList.add('active');
             
             // Filter returns based on tab
             filterReturnsByStatus(tabName);
@@ -3357,136 +3813,358 @@ textarea { resize: vertical; min-height: 60px; }
         });
     }
 
-    // View Order Details
+    // View Order Details - FIXED FUNCTION
     function viewOrderDetails(orderId) {
-        // In a real implementation, you would fetch order details via AJAX
-        // For now, we'll show a placeholder with enhanced information
+        console.log('Fetching order details for ID:', orderId);
+        
+        // Show loading message
         document.getElementById('orderDetailsContent').innerHTML = `
-            <div style="padding: 20px;">
-                <h4 style="margin-bottom: 15px; color: var(--primary);">Order #${orderId} Details</h4>
-                <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
-                    <h5 style="margin: 0 0 10px 0;">Order Information</h5>
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                        <div><strong>Order Date:</strong> ${new Date().toLocaleDateString()}</div>
-                        <div><strong>Status:</strong> <span class="status-badge status-pending">Pending</span></div>
-                        <div><strong>Total Amount:</strong> UGX 0</div>
-                        <div><strong>Payment Method:</strong> Cash on Delivery</div>
-                    </div>
-                </div>
-                <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
-                    <h5 style="margin: 0 0 10px 0;">Customer Information</h5>
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                        <div><strong>Name:</strong> Customer Name</div>
-                        <div><strong>Email:</strong> customer@example.com</div>
-                        <div><strong>Phone:</strong> +256 700 000 000</div>
-                        <div><strong>Location:</strong> Bugema University</div>
-                    </div>
-                </div>
-                <div style="background: #f8f9fa; padding: 15px; border-radius: 8px;">
-                    <h5 style="margin: 0 0 10px 0;">Order Items</h5>
-                    <table style="width: 100%; border-collapse: collapse;">
-                        <thead>
-                            <tr style="background: var(--primary); color: white;">
-                                <th style="padding: 8px; text-align: left;">Product</th>
-                                <th style="padding: 8px; text-align: center;">Quantity</th>
-                                <th style="padding: 8px; text-align: right;">Price</th>
-                                <th style="padding: 8px; text-align: right;">Total</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr>
-                                <td style="padding: 8px; border-bottom: 1px solid #dee2e6;">Sample Product</td>
-                                <td style="padding: 8px; text-align: center; border-bottom: 1px solid #dee2e6;">1</td>
-                                <td style="padding: 8px; text-align: right; border-bottom: 1px solid #dee2e6;">UGX 10,000</td>
-                                <td style="padding: 8px; text-align: right; border-bottom: 1px solid #dee2e6;">UGX 10,000</td>
-                            </tr>
-                        </tbody>
-                        <tfoot>
-                            <tr>
-                                <td colspan="3" style="padding: 8px; text-align: right; font-weight: bold;">Total:</td>
-                                <td style="padding: 8px; text-align: right; font-weight: bold;">UGX 10,000</td>
-                            </tr>
-                        </tfoot>
-                    </table>
-                </div>
-                <div style="margin-top: 15px; text-align: center;">
-                    <button class="btn" onclick="window.print()">Print Invoice</button>
-                    <button class="btn secondary" onclick="document.getElementById('orderDetailsModal').style.display = 'none'">Close</button>
-                </div>
+            <div style="padding: 40px; text-align: center;">
+                <div class="spinner" style="border: 4px solid #f3f3f3; border-top: 4px solid var(--primary); border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto 20px;"></div>
+                <p>Loading order details...</p>
             </div>
+            <style>
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+            </style>
         `;
-        document.getElementById('orderDetailsModal').style.display = 'block';
+        
+        // Show modal
+        document.getElementById('orderDetailsModal').style.display = 'flex';
+        
+        // Fetch order details via AJAX
+        fetch(`admin_dashboard.php?get_order_details=${orderId}`)
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('Network response was not ok: ' + response.status);
+                }
+                return response.json();
+            })
+            .then(data => {
+                console.log('Order details response:', data);
+                
+                if (data.error) {
+                    document.getElementById('orderDetailsContent').innerHTML = `
+                        <div style="padding: 20px; text-align: center; color: var(--danger);">
+                            <h4>Error Loading Order Details</h4>
+                            <p>${data.error}</p>
+                            <button class="btn secondary" onclick="document.getElementById('orderDetailsModal').style.display='none'">Close</button>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                if (!data.success) {
+                    document.getElementById('orderDetailsContent').innerHTML = `
+                        <div style="padding: 20px; text-align: center; color: var(--danger);">
+                            <h4>Order Not Found</h4>
+                            <p>Order #${orderId} could not be found in the database.</p>
+                            <button class="btn secondary" onclick="document.getElementById('orderDetailsModal').style.display='none'">Close</button>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                const order = data.order;
+                const items = data.items;
+                
+                // Format the order details
+                const createdDate = order.created_at ? 
+                    new Date(order.created_at).toLocaleDateString('en-US', {
+                        year: 'numeric',
+                        month: 'long',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    }) : 'Date not available';
+                
+                let itemsHtml = '';
+                let totalAmount = 0;
+                
+                if (items && items.length > 0) {
+                    items.forEach(item => {
+                        const itemTotal = (item.quantity || 1) * (item.price || 0);
+                        totalAmount += itemTotal;
+                        
+                        itemsHtml += `
+                            <tr>
+                                <td>${item.product_name || 'Unknown Product'}</td>
+                                <td style="text-align: center;">${item.quantity || 1}</td>
+                                <td style="text-align: right;">UGX ${parseFloat(item.price || 0).toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                                <td style="text-align: right;">UGX ${itemTotal.toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                            </tr>
+                        `;
+                    });
+                } else {
+                    itemsHtml = `<tr><td colspan="4" style="text-align:center; padding:20px;">No items found for this order.</td></tr>`;
+                }
+                
+                const statusClass = `status-${(order.status || 'pending').toLowerCase().replace(' ', '-')}`;
+                const paymentMethod = order.payment_method || 'Cash';
+                const paymentClass = `payment-${paymentMethod.toLowerCase().replace(' ', '-')}`;
+                
+                document.getElementById('orderDetailsContent').innerHTML = `
+                    <div style="padding: 20px;">
+                        <h4 style="margin-bottom: 15px; color: var(--primary);">Order #${order.id} Details</h4>
+                        
+                        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                            <h5 style="margin: 0 0 10px 0;">Order Information</h5>
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Order Date:</span>
+                                    <span class="order-details-value">${createdDate}</span>
+                                </div>
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Status:</span>
+                                    <span class="order-details-value">
+                                        <span class="status-badge ${statusClass}" style="padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; text-transform: uppercase;">
+                                            ${order.status || 'Pending'}
+                                        </span>
+                                    </span>
+                                </div>
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Total Amount:</span>
+                                    <span class="order-details-value">UGX ${parseFloat(order.total_amount || 0).toLocaleString('en-US', {minimumFractionDigits: 2})}</span>
+                                </div>
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Payment Method:</span>
+                                    <span class="order-details-value">
+                                        <span class="status-badge ${paymentClass}" style="padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; text-transform: uppercase;">
+                                            ${paymentMethod}
+                                        </span>
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                            <h5 style="margin: 0 0 10px 0;">Customer Information</h5>
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Name:</span>
+                                    <span class="order-details-value">${order.username || 'Guest'}</span>
+                                </div>
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Email:</span>
+                                    <span class="order-details-value">${order.email || 'N/A'}</span>
+                                </div>
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Phone:</span>
+                                    <span class="order-details-value">${order.phone || 'N/A'}</span>
+                                </div>
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Shipping Address:</span>
+                                    <span class="order-details-value">${order.shipping_address || order.address || 'N/A'}</span>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px;">
+                            <h5 style="margin: 0 0 10px 0;">Order Items</h5>
+                            <table class="order-items-table">
+                                <thead>
+                                    <tr>
+                                        <th>Product</th>
+                                        <th style="text-align: center;">Quantity</th>
+                                        <th style="text-align: right;">Price</th>
+                                        <th style="text-align: right;">Total</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${itemsHtml}
+                                </tbody>
+                                <tfoot>
+                                    <tr class="order-total">
+                                        <td colspan="3" style="text-align: right; padding: 12px;">Total:</td>
+                                        <td style="text-align: right; padding: 12px;">UGX ${totalAmount.toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                                    </tr>
+                                </tfoot>
+                            </table>
+                        </div>
+                        
+                        <div style="margin-top: 15px; text-align: center;">
+                            <button class="btn" onclick="printOrderInvoice(${order.id})">Print Invoice</button>
+                            <button class="btn secondary" onclick="document.getElementById('orderDetailsModal').style.display='none'">Close</button>
+                        </div>
+                    </div>
+                `;
+            })
+            .catch(error => {
+                console.error('Error fetching order details:', error);
+                document.getElementById('orderDetailsContent').innerHTML = `
+                    <div style="padding: 20px; text-align: center; color: var(--danger);">
+                        <h4>Error Loading Order Details</h4>
+                        <p>There was an error loading the order details. Please try again.</p>
+                        <p><small>Error: ${error.message}</small></p>
+                        <button class="btn secondary" onclick="document.getElementById('orderDetailsModal').style.display='none'">Close</button>
+                    </div>
+                `;
+            });
     }
 
-    // Close order modal
-    document.getElementById('closeOrderModal')?.addEventListener('click', function() {
-        document.getElementById('orderDetailsModal').style.display = 'none';
-    });
+    // Print order invoice
+    function printOrderInvoice(orderId) {
+        window.open(`admin_dashboard.php?generate_invoice=${orderId}`, '_blank');
+    }
 
     // Edit User Role
     function editUserRole(userId, currentRole) {
         document.getElementById('user_id').value = userId;
         document.getElementById('user_role').value = currentRole;
-        document.getElementById('editUserRoleModal').style.display = 'block';
+        document.getElementById('editUserRoleModal').style.display = 'flex';
     }
 
-    // Close user modal
-    document.getElementById('closeUserModal')?.addEventListener('click', function() {
-        document.getElementById('editUserRoleModal').style.display = 'none';
-    });
-    document.getElementById('cancelUserEdit')?.addEventListener('click', function() {
-        document.getElementById('editUserRoleModal').style.display = 'none';
-    });
-
-    // View Return Details
+    // View Return Details - FIXED FUNCTION
     function viewReturnDetails(returnId) {
+        console.log('Fetching return details for ID:', returnId);
+        
+        // Show loading message
         document.getElementById('returnDetailsContent').innerHTML = `
-            <div style="padding: 20px;">
-                <h4 style="margin-bottom: 15px; color: var(--primary);">Return Request #${returnId}</h4>
-                <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
-                    <h5 style="margin: 0 0 10px 0;">Return Information</h5>
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                        <div><strong>Return Date:</strong> ${new Date().toLocaleDateString()}</div>
-                        <div><strong>Status:</strong> <span class="status-badge return-pending">Pending</span></div>
-                        <div><strong>Order ID:</strong> #${returnId}</div>
-                        <div><strong>Product:</strong> Sample Product</div>
-                        <div><strong>Quantity:</strong> 1</div>
-                        <div><strong>Refund Amount:</strong> UGX 10,000</div>
-                    </div>
-                </div>
-                <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
-                    <h5 style="margin: 0 0 10px 0;">Customer Information</h5>
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                        <div><strong>Name:</strong> Customer Name</div>
-                        <div><strong>Email:</strong> customer@example.com</div>
-                        <div><strong>Phone:</strong> +256 700 000 000</div>
-                    </div>
-                </div>
-                <div style="background: #f8f9fa; padding: 15px; border-radius: 8px;">
-                    <h5 style="margin: 0 0 10px 0;">Return Reason</h5>
-                    <p style="margin: 0; padding: 10px; background: white; border-radius: 5px; border-left: 3px solid var(--primary);">
-                        The product did not meet my expectations. The quality was not as described and the size was incorrect.
-                    </p>
-                </div>
-                <div style="margin-top: 15px; text-align: center;">
-                    <button class="btn secondary" onclick="document.getElementById('returnDetailsModal').style.display = 'none'">Close</button>
-                </div>
+            <div style="padding: 40px; text-align: center;">
+                <div class="spinner" style="border: 4px solid #f3f3f3; border-top: 4px solid var(--primary); border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto 20px;"></div>
+                <p>Loading return details...</p>
             </div>
         `;
-        document.getElementById('returnDetailsModal').style.display = 'block';
+        
+        // Show modal
+        document.getElementById('returnDetailsModal').style.display = 'flex';
+        
+        // Fetch return details via AJAX
+        fetch(`admin_dashboard.php?get_return_details=${returnId}`)
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('Network response was not ok: ' + response.status);
+                }
+                return response.json();
+            })
+            .then(data => {
+                console.log('Return details response:', data);
+                
+                if (data.error) {
+                    document.getElementById('returnDetailsContent').innerHTML = `
+                        <div style="padding: 20px; text-align: center; color: var(--danger);">
+                            <h4>Error Loading Return Details</h4>
+                            <p>${data.error}</p>
+                            <button class="btn secondary" onclick="document.getElementById('returnDetailsModal').style.display='none'">Close</button>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                if (!data.success) {
+                    document.getElementById('returnDetailsContent').innerHTML = `
+                        <div style="padding: 20px; text-align: center; color: var(--danger);">
+                            <h4>Return Request Not Found</h4>
+                            <p>Return request #${returnId} could not be found in the database.</p>
+                            <button class="btn secondary" onclick="document.getElementById('returnDetailsModal').style.display='none'">Close</button>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                const returnData = data.return;
+                const createdDate = returnData.created_at ? 
+                    new Date(returnData.created_at).toLocaleDateString('en-US', {
+                        year: 'numeric',
+                        month: 'long',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    }) : 'Date not available';
+                
+                const statusClass = `return-${(returnData.status || 'pending').toLowerCase()}`;
+                const refundAmount = returnData.refund_amount || (returnData.product_price || 0) * (returnData.quantity || 1);
+                
+                document.getElementById('returnDetailsContent').innerHTML = `
+                    <div style="padding: 20px;">
+                        <h4 style="margin-bottom: 15px; color: var(--primary);">Return Request #${returnData.id}</h4>
+                        
+                        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                            <h5 style="margin: 0 0 10px 0;">Return Information</h5>
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Return Date:</span>
+                                    <span class="order-details-value">${createdDate}</span>
+                                </div>
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Status:</span>
+                                    <span class="order-details-value">
+                                        <span class="status-badge ${statusClass}" style="padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; text-transform: uppercase;">
+                                            ${returnData.status || 'Pending'}
+                                        </span>
+                                    </span>
+                                </div>
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Order ID:</span>
+                                    <span class="order-details-value">#${returnData.order_id || 'N/A'}</span>
+                                </div>
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Product:</span>
+                                    <span class="order-details-value">${returnData.product_name || 'Unknown Product'}</span>
+                                </div>
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Quantity:</span>
+                                    <span class="order-details-value">${returnData.quantity || 1}</span>
+                                </div>
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Refund Amount:</span>
+                                    <span class="order-details-value">UGX ${parseFloat(refundAmount).toLocaleString('en-US', {minimumFractionDigits: 2})}</span>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                            <h5 style="margin: 0 0 10px 0;">Customer Information</h5>
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Name:</span>
+                                    <span class="order-details-value">${returnData.username || 'Guest'}</span>
+                                </div>
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Email:</span>
+                                    <span class="order-details-value">${returnData.email || 'N/A'}</span>
+                                </div>
+                                <div class="order-details-item">
+                                    <span class="order-details-label">Phone:</span>
+                                    <span class="order-details-value">${returnData.phone || 'N/A'}</span>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px;">
+                            <h5 style="margin: 0 0 10px 0;">Return Reason</h5>
+                            <p style="margin: 0; padding: 10px; background: white; border-radius: 5px; border-left: 3px solid var(--primary);">
+                                ${returnData.reason || 'No reason provided.'}
+                            </p>
+                        </div>
+                        
+                        <div style="margin-top: 15px; text-align: center;">
+                            <button class="btn secondary" onclick="document.getElementById('returnDetailsModal').style.display='none'">Close</button>
+                        </div>
+                    </div>
+                `;
+            })
+            .catch(error => {
+                console.error('Error fetching return details:', error);
+                document.getElementById('returnDetailsContent').innerHTML = `
+                    <div style="padding: 20px; text-align: center; color: var(--danger);">
+                        <h4>Error Loading Return Details</h4>
+                        <p>There was an error loading the return details. Please try again.</p>
+                        <p><small>Error: ${error.message}</small></p>
+                        <button class="btn secondary" onclick="document.getElementById('returnDetailsModal').style.display='none'">Close</button>
+                    </div>
+                `;
+            });
     }
-
-    // Close return modal
-    document.getElementById('closeReturnModal')?.addEventListener('click', function() {
-        document.getElementById('returnDetailsModal').style.display = 'none';
-    });
 
     // Refresh orders button
     document.getElementById('refreshOrdersBtn')?.addEventListener('click', function() {
         location.reload();
     });
 
-    // Chart initialization - FIXED: Wait for DOM to be fully loaded
+    // Chart initialization
     document.addEventListener('DOMContentLoaded', function() {
         initializeCharts();
     });
